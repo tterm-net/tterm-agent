@@ -1,7 +1,10 @@
 # tterm-agent
 
-Connects your computer to [tTerm](https://tterm.net) — a terminal inside
-Telegram.
+Connects your computer to **[tTerm](https://tterm.net)** — Terminal in Telegram
+with multi-user access.
+
+[tterm.net](https://tterm.net) · [open the bot](https://t.me/tTermNetBot) ·
+[updates](https://t.me/tTermBlog) · [bot source](https://github.com/tterm-net/tTerm)
 
 ## Why it exists
 
@@ -73,6 +76,13 @@ Autostart log: `~/.tterm/agent.log`
 ## Requirements
 
 Python 3.11+. On macOS: `brew install python@3.12`.
+
+## Links
+
+- [tterm.net](https://tterm.net) — the site, with release notes
+- [@tTermNetBot](https://t.me/tTermNetBot) — the bot itself
+- [@tTermBlog](https://t.me/tTermBlog) — updates and news
+- [tTerm](https://github.com/tterm-net/tTerm) — the bot's source code
 
 ## License
 
