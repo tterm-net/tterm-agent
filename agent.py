@@ -37,7 +37,7 @@ import signal
 import sys
 import time
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 DEFAULT_HUB = "wss://install.tterm.net/agent"
 
@@ -50,6 +50,12 @@ READ_CHUNK = 65536
 #: How often we send a sign of life, and how long we tolerate silence back.
 HEARTBEAT = 20.0
 SILENCE_LIMIT = 50.0
+
+#: How often to say in the log that the link is still up. Without this a quiet
+#: log is ambiguous: it reads the same whether the agent sat there healthy for
+#: an hour or hung in a dead socket. One line every ten minutes turns a gap in
+#: the log into evidence instead of a guess.
+ALIVE_EVERY = 600.0
 
 #: How far the monotonic clock must drift from the wall clock before we call
 #: it a sleep. On macOS the monotonic clock stops while asleep, so the gap
@@ -207,8 +213,13 @@ async def serve(ws, shell: Shell, health: Health) -> None:
 
 async def watchdog(ws, health: Health) -> None:
     """Drops a dead connection so that reconnection can kick in."""
+    last_note = time.monotonic()
     while True:
         await asyncio.sleep(HEARTBEAT)
+
+        if time.monotonic() - last_note >= ALIVE_EVERY:
+            last_note = time.monotonic()
+            log(f"link alive, hub answered {health.silent_for():.0f}s ago")
 
         drift = health.slept()
         if drift > SLEEP_JUMP:
