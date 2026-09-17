@@ -32,12 +32,13 @@ import contextlib
 import json
 import os
 import platform
+import pwd
 import pty
 import signal
 import sys
 import time
 
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 
 DEFAULT_HUB = "wss://install.tterm.net/agent"
 
@@ -105,13 +106,27 @@ class Shell:
         self.pid: int | None = None
         self.fd: int | None = None
 
+    #: Shells the marker is written for. Anything else falls back to bash,
+    #: which is present on macOS and on nearly every Linux.
+    KNOWN = ("bash", "zsh")
+
+    @staticmethod
+    def pick() -> str:
+        """The shell to run: the person's own, when we can speak to it.
+
+        Started from autostart there is no SHELL in the environment, so ask
+        the account database — otherwise everyone on macOS, where zsh has been
+        the default since 2019, would get bash and none of their PATH.
+        """
+        shell = os.environ.get("SHELL", "")
+        if not shell:
+            with contextlib.suppress(Exception):
+                shell = pwd.getpwuid(os.getuid()).pw_shell
+        return shell if any(k in os.path.basename(shell or "")
+                            for k in Shell.KNOWN) else "/bin/bash"
+
     def start(self) -> None:
-        shell = os.environ.get("SHELL", "/bin/bash")
-        # The prompt marker and bootstrap assume bash. If the user's login
-        # shell is zsh or fish we still start bash: it is present on macOS and
-        # on nearly every Linux, and we do not yet ship a bootstrap per shell.
-        if "bash" not in os.path.basename(shell):
-            shell = "/bin/bash"
+        shell = self.pick()
         pid, fd = pty.fork()
         if pid == 0:
             os.environ["TERM"] = "xterm-256color"
@@ -124,7 +139,13 @@ class Shell:
             home = os.path.expanduser("~")
             if os.path.isdir(home):
                 os.chdir(home)
-            os.execvp(shell, [shell, "--noediting", "-i"])
+            if "zsh" in os.path.basename(shell):
+                # zsh has no --noediting; -f keeps the line editor from
+                # redrawing what we already sent, which is what the flag is
+                # for on the bash side.
+                os.execvp(shell, [shell, "-i"])
+            else:
+                os.execvp(shell, [shell, "--noediting", "-i"])
         self.pid, self.fd = pid, fd
 
     @property
@@ -248,6 +269,9 @@ async def connect_once(hub: str, token: str, name: str) -> None:
             "user": os.environ.get("USER") or os.environ.get("LOGNAME", ""),
             "os": f"{platform.system()} {platform.release()}",
             "agent": __version__,
+            # The bot writes its prompt marker differently for each shell, so
+            # it has to know which one is on this end.
+            "shell": os.path.basename(Shell.pick()),
         }))
         reply = json.loads(await ws.recv())
         if reply.get("t") != "welcome":
