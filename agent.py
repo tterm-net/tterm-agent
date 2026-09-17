@@ -38,7 +38,7 @@ import signal
 import sys
 import time
 
-__version__ = "0.8.0"
+__version__ = "0.8.2"
 
 DEFAULT_HUB = "wss://install.tterm.net/agent"
 
@@ -139,10 +139,17 @@ class Shell:
             home = os.path.expanduser("~")
             if os.path.isdir(home):
                 os.chdir(home)
+            # Not a login shell, deliberately. A login shell reads the profile
+            # files, which on macOS spawn path_helper — and while that runs the
+            # shell is not yet reading its input, so the bootstrap sent right
+            # after start goes into a buffer the line editor then discards.
+            # The marker never arrives and the machine looks broken.
+            #
+            # What a login shell was wanted for — the system PATH — the
+            # bootstrap takes directly instead.
             if "zsh" in os.path.basename(shell):
-                # zsh has no --noediting; -f keeps the line editor from
-                # redrawing what we already sent, which is what the flag is
-                # for on the bash side.
+                # zsh has no --noediting; the bootstrap turns off its line
+                # editor instead.
                 os.execvp(shell, [shell, "-i"])
             else:
                 os.execvp(shell, [shell, "--noediting", "-i"])
