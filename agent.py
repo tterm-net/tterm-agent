@@ -38,7 +38,7 @@ import signal
 import sys
 import time
 
-__version__ = "0.8.2"
+__version__ = "0.9.0"
 
 DEFAULT_HUB = "wss://install.tterm.net/agent"
 
@@ -105,6 +105,12 @@ class Shell:
     def __init__(self) -> None:
         self.pid: int | None = None
         self.fd: int | None = None
+        #: Bumped on every start. Comparing descriptors is not enough to tell
+        #: a restart from a death: between stop() and start() there is no
+        #: descriptor at all, and whoever is reading would call that the end.
+        self.generation = 0
+        #: Set when the shell is being closed for good rather than replaced.
+        self.finished = False
 
     #: Shells the marker is written for. Anything else falls back to bash,
     #: which is present on macOS and on nearly every Linux.
@@ -126,6 +132,8 @@ class Shell:
                             for k in Shell.KNOWN) else "/bin/bash"
 
     def start(self) -> None:
+        self.generation += 1
+        self.finished = False
         shell = self.pick()
         pid, fd = pty.fork()
         if pid == 0:
@@ -163,15 +171,28 @@ class Shell:
         if self.fd is not None:
             os.write(self.fd, data.encode())
 
-    def stop(self) -> None:
-        if self.fd is not None:
-            with contextlib.suppress(OSError):
-                os.close(self.fd)
-            self.fd = None
+    def restart(self) -> None:
+        """Starts a fresh shell in place of the current one."""
+        self.stop(final=False)
+        self.start()
+
+    def stop(self, final: bool = True) -> None:
+        """Ends the shell, waking whoever is reading it.
+
+        The child goes first and the descriptor second. Closing the descriptor
+        does not wake a read already blocked on it — the reading thread would
+        hang on a dead shell and never see the next one. Ending the child makes
+        that read return end-of-stream, which is the only thing that frees it.
+        """
+        self.finished = final
         if self.pid:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(self.pid, signal.SIGHUP)
             self.pid = None
+        if self.fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self.fd)
+            self.fd = None
 
 
 class Health:
@@ -205,15 +226,28 @@ class Health:
 
 
 async def pump_shell(shell: Shell, ws) -> None:
-    """Reads the shell's output and forwards it to the hub."""
+    """Reads the shell's output and forwards it to the hub.
+
+    Survives a shell restart. When the hub closes an idle session the shell is
+    replaced under us, and the read on the old descriptor fails — which must
+    not end this task, or the whole connection comes down with it and the
+    machine drops out of the list.
+    """
     loop = asyncio.get_running_loop()
-    while shell.alive:
-        assert shell.fd is not None
+    while not shell.finished:
+        fd, gen = shell.fd, shell.generation
+        if fd is None:
+            await asyncio.sleep(0.05)     # mid-restart, the new one is coming
+            continue
         try:
-            data = await loop.run_in_executor(None, os.read, shell.fd, READ_CHUNK)
+            data = await loop.run_in_executor(None, os.read, fd, READ_CHUNK)
         except OSError:
-            break
+            data = b""
         if not data:
+            if shell.generation != gen or not shell.finished:
+                # Replaced rather than gone: pick up the new descriptor.
+                await asyncio.sleep(0.05)
+                continue
             break
         await ws.send(json.dumps({
             "t": "out",
@@ -233,8 +267,13 @@ async def serve(ws, shell: Shell, health: Health) -> None:
         if kind == "in":
             shell.write(msg.get("data", ""))
         elif kind == "close":
-            log("hub closed the session")
-            return
+            # The hub closes a shell it has not seen used for a while. That is
+            # about the shell, not about the link: dropping the connection here
+            # made the machine disappear from the list for the seconds it took
+            # to reconnect, once every idle timeout. The shell restarts on the
+            # next command instead.
+            log("hub closed the session, keeping the link")
+            shell.restart()
         elif kind == "ping":
             await ws.send(json.dumps({"t": "pong"}))
 
@@ -309,7 +348,7 @@ async def connect_once(hub: str, token: str, name: str) -> None:
         finally:
             # Closing the fd unblocks the stuck os.read in its thread —
             # without this the thread would live until the process exits.
-            shell.stop()
+            shell.stop(final=True)
             for task in (pump, srv, dog):
                 task.cancel()
             with contextlib.suppress(Exception):
