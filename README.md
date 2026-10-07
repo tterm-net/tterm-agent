@@ -31,7 +31,12 @@ computer — that works today.
 
 ## What the agent does, and what it does not
 
-Does: starts a local `bash` in a pseudo-terminal and pipes its bytes both ways.
+Does: starts your own shell, bash or zsh, in a pseudo-terminal and pipes its
+bytes both ways. Each terminal window you open in the bot gets a shell of its
+own, so a `cd` in one leaves the others where they were.
+
+To update, run the install command from the bot again (`/addhost` → Computer).
+The computer stays in your list as it is.
 
 Does **not**:
 

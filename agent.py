@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import os
@@ -38,7 +39,7 @@ import signal
 import sys
 import time
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 DEFAULT_HUB = "wss://install.tterm.net/agent"
 
@@ -57,6 +58,19 @@ SILENCE_LIMIT = 50.0
 #: an hour or hung in a dead socket. One line every ten minutes turns a gap in
 #: the log into evidence instead of a guess.
 ALIVE_EVERY = 600.0
+
+#: Shells one connection may hold, one per terminal window. Not a policy, only
+#: a stop for a runaway that keeps opening windows.
+MAX_SHELLS = 16
+
+#: Each shell's output is read by a thread blocked in os.read, as before: it
+#: behaves the same on every macOS and Linux, while watching a pseudo-terminal
+#: from asyncio has not always worked on macOS. The default pool is sized by
+#: CPU count, and with a reader per window it would run out – the next
+#: window's output would sit unread. So readers get their own pool, one
+#: thread per shell the cap allows and a few spare.
+READERS = concurrent.futures.ThreadPoolExecutor(
+    max_workers=MAX_SHELLS + 4, thread_name_prefix="tterm-read")
 
 #: How far the monotonic clock must drift from the wall clock before we call
 #: it a sleep. On macOS the monotonic clock stops while asleep, so the gap
@@ -105,12 +119,6 @@ class Shell:
     def __init__(self) -> None:
         self.pid: int | None = None
         self.fd: int | None = None
-        #: Bumped on every start. Comparing descriptors is not enough to tell
-        #: a restart from a death: between stop() and start() there is no
-        #: descriptor at all, and whoever is reading would call that the end.
-        self.generation = 0
-        #: Set when the shell is being closed for good rather than replaced.
-        self.finished = False
 
     #: Shells the marker is written for. Anything else falls back to bash,
     #: which is present on macOS and on nearly every Linux.
@@ -132,8 +140,6 @@ class Shell:
                             for k in Shell.KNOWN) else "/bin/bash"
 
     def start(self) -> None:
-        self.generation += 1
-        self.finished = False
         shell = self.pick()
         pid, fd = pty.fork()
         if pid == 0:
@@ -171,20 +177,14 @@ class Shell:
         if self.fd is not None:
             os.write(self.fd, data.encode())
 
-    def restart(self) -> None:
-        """Starts a fresh shell in place of the current one."""
-        self.stop(final=False)
-        self.start()
-
-    def stop(self, final: bool = True) -> None:
+    def stop(self) -> None:
         """Ends the shell, waking whoever is reading it.
 
         The child goes first and the descriptor second. Closing the descriptor
         does not wake a read already blocked on it — the reading thread would
-        hang on a dead shell and never see the next one. Ending the child makes
-        that read return end-of-stream, which is the only thing that frees it.
+        hang on a dead shell. Ending the child makes that read return
+        end-of-stream, which is the only thing that frees it.
         """
-        self.finished = final
         if self.pid:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(self.pid, signal.SIGHUP)
@@ -225,38 +225,92 @@ class Health:
         return time.monotonic() - self.last_in
 
 
-async def pump_shell(shell: Shell, ws) -> None:
-    """Reads the shell's output and forwards it to the hub.
+class Shells:
+    """The shells of one connection: one per terminal window in the bot.
 
-    Survives a shell restart. When the hub closes an idle session the shell is
-    replaced under us, and the read on the old descriptor fails — which must
-    not end this task, or the whole connection comes down with it and the
-    machine drops out of the list.
+    The hub names each window with a channel number, and every message about
+    it carries that number both ways. Before this there was one shell per
+    machine, so the windows in the bot were only labels: `cd` in one moved all
+    of them, a command in one went into whatever was running in another, and
+    closing one killed the rest.
+
+    An older hub sends no channel at all. Everything then goes to a single
+    shell and the replies go back without a channel, exactly as before.
     """
-    loop = asyncio.get_running_loop()
-    while not shell.finished:
-        fd, gen = shell.fd, shell.generation
-        if fd is None:
-            await asyncio.sleep(0.05)     # mid-restart, the new one is coming
-            continue
-        try:
-            data = await loop.run_in_executor(None, os.read, fd, READ_CHUNK)
-        except OSError:
-            data = b""
-        if not data:
-            if shell.generation != gen or not shell.finished:
-                # Replaced rather than gone: pick up the new descriptor.
-                await asyncio.sleep(0.05)
-                continue
-            break
-        await ws.send(json.dumps({
-            "t": "out",
-            "data": data.decode("utf-8", "replace"),
-        }))
+
+    def __init__(self, ws) -> None:
+        self.ws = ws
+        self._shells: dict[int | None, Shell] = {}
+        self._pumps: set[asyncio.Task] = set()
+        #: Set when the single shell an older hub uses exits on its own. Such
+        #: a hub learns that only by the connection dropping, so it is dropped.
+        self.legacy_gone = asyncio.Event()
+
+    async def send(self, ch: int | None, msg: dict) -> None:
+        if ch is not None:
+            msg["ch"] = ch
+        with contextlib.suppress(Exception):    # a dying link is serve's news
+            await self.ws.send(json.dumps(msg))
+
+    async def write(self, ch: int | None, data: str) -> None:
+        shell = self._shells.get(ch)
+        if shell is None:
+            # Started on first use. A shell sits idle in memory otherwise, and
+            # the hub may never open a second window at all.
+            if len(self._shells) >= MAX_SHELLS:
+                await self.send(ch, {"t": "out", "data":
+                    "tterm-agent: too many terminals open on this machine\r\n"})
+                await self.send(ch, {"t": "exit"})
+                return
+            shell = Shell()
+            shell.start()
+            self._shells[ch] = shell
+            task = asyncio.create_task(self._pump(ch, shell))
+            self._pumps.add(task)
+            task.add_done_callback(self._pumps.discard)
+        shell.write(data)
+
+    def close(self, ch: int | None) -> bool:
+        """The hub is done with this window: end its shell and only that."""
+        shell = self._shells.pop(ch, None)
+        if shell is None:
+            return False        # already gone, for instance after `exit`
+        shell.stop()
+        return True
+
+    def close_all(self) -> None:
+        for ch in list(self._shells):
+            self.close(ch)
+        for task in list(self._pumps):
+            task.cancel()
+
+    async def _pump(self, ch: int | None, shell: Shell) -> None:
+        """Forwards one shell's output, tagged with its window."""
+        loop = asyncio.get_running_loop()
+        while shell.fd is not None:
+            try:
+                data = await loop.run_in_executor(READERS, os.read, shell.fd,
+                                                  READ_CHUNK)
+            except (OSError, TypeError):
+                data = b""
+            if not data:
+                break
+            await self.send(ch, {"t": "out",
+                                 "data": data.decode("utf-8", "replace")})
+
+        if self._shells.get(ch) is shell:
+            # Gone on its own – someone typed `exit` – rather than closed by
+            # the hub. Say so, or the hub keeps typing into a fresh shell that
+            # never got its prompt marker and waits for an answer forever.
+            self._shells.pop(ch, None)
+            shell.stop()
+            await self.send(ch, {"t": "exit"})
+            if ch is None:
+                self.legacy_gone.set()
 
 
-async def serve(ws, shell: Shell, health: Health) -> None:
-    """Takes commands from the hub and writes them into the shell."""
+async def serve(ws, shells: Shells, health: Health) -> None:
+    """Takes commands from the hub and writes them into the right shell."""
     async for raw in ws:
         health.heard()
         try:
@@ -264,16 +318,18 @@ async def serve(ws, shell: Shell, health: Health) -> None:
         except ValueError:
             continue
         kind = msg.get("t")
+        ch = msg.get("ch")
+        if ch is not None and not isinstance(ch, int):
+            continue
         if kind == "in":
-            shell.write(msg.get("data", ""))
+            await shells.write(ch, msg.get("data", ""))
         elif kind == "close":
-            # The hub closes a shell it has not seen used for a while. That is
-            # about the shell, not about the link: dropping the connection here
-            # made the machine disappear from the list for the seconds it took
-            # to reconnect, once every idle timeout. The shell restarts on the
-            # next command instead.
-            log("hub closed the session, keeping the link")
-            shell.restart()
+            # The hub closes a window it has not seen used for a while, or one
+            # the person closed. That is about the window, not about the
+            # link: the connection and every other window stay as they are.
+            if shells.close(ch):
+                where = "the session" if ch is None else f"terminal {ch}"
+                log(f"hub closed {where}, keeping the link")
         elif kind == "ping":
             await ws.send(json.dumps({"t": "pong"}))
 
@@ -318,6 +374,9 @@ async def connect_once(hub: str, token: str, name: str) -> None:
             # The bot writes its prompt marker differently for each shell, so
             # it has to know which one is on this end.
             "shell": os.path.basename(Shell.pick()),
+            # This agent keeps a shell per terminal window. A hub that does
+            # not look for this keeps talking the old way and still works.
+            "channels": 1,
         }))
         reply = json.loads(await ws.recv())
         if reply.get("t") != "welcome":
@@ -327,29 +386,27 @@ async def connect_once(hub: str, token: str, name: str) -> None:
             raise RuntimeError(error)
         log(f"connected as \u00ab{reply.get('name', name)}\u00bb")
 
-        shell = Shell()
-        shell.start()
+        shells = Shells(ws)
         health = Health()
-        pump = asyncio.create_task(pump_shell(shell, ws))
-        srv = asyncio.create_task(serve(ws, shell, health))
+        srv = asyncio.create_task(serve(ws, shells, health))
         dog = asyncio.create_task(watchdog(ws, health))
+        gone = asyncio.create_task(shells.legacy_gone.wait())
         try:
-            # Wait for the first task to finish, not for all of them.
-            # Otherwise, when the link drops (the laptop was closed), serve
-            # fails while pump_shell stays forever inside a blocking os.read
-            # in its thread — and the agent never reconnects. That is exactly
-            # what used to break after sleep.
+            # Wait for the first task to finish, not for all of them. When the
+            # link drops (the laptop was closed) serve fails, and waiting for
+            # the rest would mean waiting forever — the agent would never
+            # reconnect. That is exactly what used to break after sleep.
             done, _ = await asyncio.wait(
-                [pump, srv, dog], return_when=asyncio.FIRST_COMPLETED)
+                [srv, dog, gone], return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 exc = task.exception()
                 if exc is not None:
                     raise exc
         finally:
-            # Closing the fd unblocks the stuck os.read in its thread —
-            # without this the thread would live until the process exits.
-            shell.stop(final=True)
-            for task in (pump, srv, dog):
+            # Ending each shell unblocks its reader thread — without this the
+            # threads would live until the process exits.
+            shells.close_all()
+            for task in (srv, dog, gone):
                 task.cancel()
             with contextlib.suppress(Exception):
                 await ws.close()
