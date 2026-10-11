@@ -91,4 +91,15 @@ Python 3.11+. On macOS: `brew install python@3.12`.
 
 ## License
 
-MIT
+Copyright (C) 2026 Denis Gerasimenko
+
+The tTerm agent is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License, version 3, as
+published by the Free Software Foundation. See [LICENSE](LICENSE).
+
+Using the tTerm agent with your own machines places no obligations on you.
+The license matters when you distribute a modified version or run one as a
+service for others: then you must offer its source to the people who use it.
+
+Versions published before 10 October 2026 were released under the MIT license
+and remain available under it.

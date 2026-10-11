@@ -22,7 +22,7 @@ Stop it: launchctl unload (macOS) / systemctl --user stop (Linux),
 or just Ctrl+C if you started it by hand.
 
 Source: https://github.com/tterm-net/tterm-agent
-License: MIT
+License: AGPL-3.0-only (see LICENSE)
 """
 from __future__ import annotations
 
