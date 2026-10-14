@@ -1,7 +1,9 @@
 # tterm-agent
 
 Connects your computer to **[tTerm](https://tterm.net)** — Terminal in Telegram
-with multi-user access.
+with multi-user access, and, from version 0.11.0, to
+[tTerm Web](https://github.com/tterm-net/tterm-web), tTerm in the browser,
+which is in development.
 
 [tterm.net](https://tterm.net) · [open the bot](https://t.me/tTermNetBot) ·
 [updates](https://t.me/tTermBlog) · [bot source](https://github.com/tterm-net/tTerm)
@@ -35,6 +37,10 @@ Does: starts your own shell, bash or zsh, in a pseudo-terminal and pipes its
 bytes both ways. Each terminal window you open in the bot gets a shell of its
 own, so a `cd` in one leaves the others where they were.
 
+For tTerm Web it also runs, when asked, short sh scripts outside any
+terminal: one puts tTerm's shell scripts into `~/.tterm` as a terminal opens,
+others answer Tab and list directories and git branches for the page.
+
 To update, run the install command from the bot again (`/addhost` → Computer).
 The computer stays in your list as it is.
 
@@ -43,7 +49,8 @@ Does **not**:
 - open any inbound port;
 - run as root — it only ever uses your own user's permissions;
 - store passwords or keys;
-- send anything except the output of commands you asked for;
+- send anything except what your terminals print and the answers to those
+  scripts;
 - carry any logic of its own on top of the shell — anything the agent can do,
   so can anyone sitting at this keyboard.
 
@@ -77,6 +84,30 @@ behind on the system.
 ```
 
 Autostart log: `~/.tterm/agent.log`
+
+## With tTerm Web
+
+The same agent serves both; which one it talks to is set by `--hub`, and a
+computer is connected to one of them at a time. tTerm Web gives the command
+under Add a machine, then Computer. For now it is started by hand, from a
+checkout of this repository:
+
+```bash
+TTERM_TOKEN=YOUR_TOKEN python3 agent.py --hub wss://YOUR-TTERM-WEB/agent
+```
+
+The computer is online while it runs; Ctrl+C disconnects it. The token
+connects it within ten minutes and from then on is the computer's key. It
+goes in the environment rather than on the command line, where any user of
+the computer could read it in the list of processes.
+
+How it talks to tTerm Web, all on one WebSocket: the hello says `"web": 1`.
+tTerm Web asks it to `open` a terminal (the command, run by your login shell
+with `-c`, the page's size, echo off for the first line), to `size` it and
+`close` it, and to `run` a script with `sh -s`. Keys come in and output goes
+out as binary frames, a byte of kind and four of channel, then the bytes as
+they are. The Telegram bot never sends these and gets the agent it always
+had.
 
 ## Requirements
 
