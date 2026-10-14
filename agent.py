@@ -13,7 +13,9 @@ any terminal: one puts tTerm's shell scripts into ~/.tterm as a terminal
 opens, others answer Tab and list directories and git branches for the page.
 No logic of its own on top of that, no access to files other than through
 the shell and those scripts. Anything the agent can do, so can anyone
-sitting at this keyboard.
+sitting at this keyboard. tTerm Web's terminals outlive a dropped
+connection: the laptop sleeps, the network blinks, and they go on where
+they were when the link is back.
 
 What it does not do:
   * never opens an inbound port;
@@ -52,7 +54,7 @@ import threading
 import time
 import warnings
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 DEFAULT_HUB = "wss://install.tterm.net/agent"
 
@@ -60,6 +62,12 @@ DEFAULT_HUB = "wss://install.tterm.net/agent"
 #: neither hammer a service that is down nor sleep through a network blip.
 BACKOFF_START = 1.0
 BACKOFF_MAX = 30.0
+
+#: A connection that held this long was a working one. When it drops, the
+#: pause starts over from BACKOFF_START instead of staying at what failures
+#: before it (no network yet after a wake, say) had grown it to.
+HEALTHY_FOR = 60.0
+
 READ_CHUNK = 65536
 
 #: How often we send a sign of life, and how long we tolerate silence back.
@@ -112,15 +120,37 @@ DRAIN_MAX = 10.0
 #: A shell that has not ended this long after its hangup is killed.
 HANGUP_GRACE = 3.0
 
+#: tTerm Web's terminals outlive a dropped connection (from 0.12.0): the
+#: laptop sleeps, the network blinks, and tTerm Web gets each terminal back
+#: where it was. What a shell printed is kept this far back, so that what
+#: was on its way when the connection went can be sent again.
+RING_MAX = 1024 * 1024
+#: Printed and not sent yet, at most. Past it the shell's output waits, as
+#: it does in a terminal nobody reads.
+UNSENT_MAX = 512 * 1024
+#: Output in one frame, at most.
+FRAME_OUT = 64 * 1024
+#: How long terminals wait for the link, counted while the computer is
+#: awake: a laptop asleep all night loses nothing.
+KEEP_FOR = 3600.0
+#: After a reconnect, how long tTerm Web has to take back the terminals
+#: offered to it. One older than 0.0.7 does not know how: they then end.
+CLAIM_WAIT = 30.0
+#: A terminal whose shell ended is kept this long after its end was sent, and
+#: offered after a reconnect: the link may have gone with the end on its way.
+#: Longer than it takes to notice a dead link (SILENCE_LIMIT).
+ENDED_KEEP = 120.0
+
 #: How far the monotonic clock must drift from the wall clock before we call
 #: it a sleep. On macOS the monotonic clock stops while asleep, so the gap
 #: between the two is the most reliable hint that the lid was closed.
 SLEEP_JUMP = 15.0
 
 #: What this agent can do for tTerm Web, said in its hello: terminals of the
-#: page's size, raw bytes both ways, and the short scripts it asks for. The
-#: bot does not look for it and keeps talking the way it always did.
-WEB_PROTOCOL = 1
+#: page's size, raw bytes both ways, and the short scripts it asks for (1);
+#: terminals kept through a dropped connection and taken back after it (2).
+#: The bot does not look for it and keeps talking the way it always did.
+WEB_PROTOCOL = 2
 
 #: tTerm Web's binary frames: a byte of kind, four of channel, then the data.
 OUTPUT, INPUT = 1, 2
@@ -176,7 +206,9 @@ def set_process_name(name: str = "tterm-agent") -> None:
 
 
 def log(msg: str) -> None:
-    print(f"[tterm-agent] {msg}", flush=True)
+    # The window it ran in may be gone: nowhere to say it then.
+    with contextlib.suppress(OSError, ValueError):
+        print(f"[tterm-agent] {msg}", flush=True)
 
 
 def login_shell() -> str:
@@ -665,6 +697,337 @@ async def run_script(script: str, timeout: float) -> tuple[int | None, bytes, by
     return proc.returncode, out[:SIDE_OUT_MAX], err[-SIDE_ERR_MAX:]
 
 
+async def bury(shell: Shell) -> int | None:
+    """The exit code of a shell whose terminal is over. One that has not
+    ended by then gets a hangup, and is killed if it ignores that."""
+    if await shell.wait(HANGUP_GRACE):
+        return shell.code
+    shell.stop()
+    if await shell.wait(HANGUP_GRACE):
+        return shell.code
+    shell.kill()
+    await shell.wait(HANGUP_GRACE)
+    return shell.code
+
+
+async def finish(shell: Shell) -> None:
+    """After the hangup: a shell that ignores it is killed."""
+    if not await shell.wait(HANGUP_GRACE):
+        shell.kill()
+
+
+async def watch(shell: Shell) -> None:
+    """Collects the shell's exit status as soon as it ends, so that it
+    never lingers as a zombie, and so that its reader knows it ended."""
+    while not shell.collect():
+        await asyncio.sleep(WAIT_STEP)
+
+
+async def feed(shell: Shell) -> None:
+    """Writes tTerm Web's keys into one terminal, in the order they came."""
+    loop = asyncio.get_running_loop()
+    inbox = shell.inbox
+    assert inbox is not None
+    while True:
+        data = await inbox.get()
+        while not inbox.empty():
+            data += inbox.get_nowait()
+        if shell.ending.is_set():
+            return
+        if data:
+            await loop.run_in_executor(WRITERS, write_all, shell, data)
+
+
+def offset(value) -> int:
+    """A byte offset from the hub: a whole number from 0, or 0."""
+    try:
+        whole = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, whole)
+
+
+class WebShell:
+    """One of tTerm Web's terminals for as long as its shell runs, over
+    whichever connection there is: none at all while the link is down.
+
+    Everything it prints is counted from its first byte, and the last of it
+    is kept. Coming back after a dropped connection, tTerm Web says how much
+    it has, and the rest is sent again: what was on its way when the link
+    went is not lost, and nothing arrives twice.
+    """
+
+    def __init__(self, ch: int, shell: Shell, registry: "WebShells") -> None:
+        self.ch = ch
+        self.shell = shell
+        self.registry = registry
+        self.head = bytes([OUTPUT]) + ch.to_bytes(4, "big")
+        #: The last of what it printed, from offset `ring_start` on.
+        self.ring = bytearray()
+        self.ring_start = 0
+        #: Bytes printed in all, and how many of them went to a connection.
+        self.produced = 0
+        self.sent = 0
+        #: Bytes tTerm Web asked for that are no longer kept, to say first.
+        self.gap = 0
+        #: The connection it goes over, None while there is none.
+        self.link: Shells | None = None
+        self.detached_at = time.monotonic()
+        #: Offered back after a reconnect: if not taken by then, it ends.
+        self.claim_by: float | None = None
+        #: Its output is over; the exit code to report, and when it was.
+        self.over = False
+        self.code: int | None = None
+        self.reported: float | None = None
+        self.closed = False
+        self.wake = asyncio.Event()
+        self.room = asyncio.Event()
+        self.room.set()
+
+    def start(self) -> None:
+        for coro in (self._pump(), self._send(), watch(self.shell)):
+            self.registry.spawn(coro)
+        if self.shell.inbox is not None:
+            self.registry.spawn(feed(self.shell))
+
+    def attach(self, link: "Shells", start: int) -> None:
+        """Goes over `link` from now on, from byte `start` of its output:
+        how much tTerm Web has. Anything it is missing is sent again."""
+        start = min(start, self.produced)
+        if start < self.ring_start:
+            self.gap = self.ring_start - start
+            start = self.ring_start
+        self.sent = start
+        self.link = link
+        self.claim_by = None
+        # Its end, if it ended, is said again after what is sent again.
+        self.reported = None
+        self.wake.set()
+
+    def detach(self) -> None:
+        self.link = None
+        self.claim_by = None
+        self.detached_at = time.monotonic()
+
+    def close(self) -> None:
+        """tTerm Web is done with it: the shell gets its hangup."""
+        if self.closed:
+            return
+        self.closed = True
+        self.shell.stop()
+        if self.shell.inbox is not None:
+            self.shell.inbox.put_nowait(b"")
+        self.room.set()
+        self.wake.set()
+        self.registry.forget(self)
+        self.registry.spawn(finish(self.shell))
+
+    def _keep(self, data: bytes) -> None:
+        self.ring += data
+        self.produced += len(data)
+        # Only what was sent goes. After a reconnect nearly all of the ring
+        # may wait to be sent again, and a read under way lands on top of
+        # it: the ring then holds that read more until it is sent.
+        extra = min(len(self.ring) - RING_MAX, self.sent - self.ring_start)
+        if extra > 0:
+            del self.ring[:extra]
+            self.ring_start += extra
+
+    async def _pump(self) -> None:
+        """Reads what the shell prints into the ring. With too much of it
+        unsent, a slow or missing connection, it stops reading, and the
+        programs in the terminal wait, as in a terminal nobody reads."""
+        loop = asyncio.get_running_loop()
+        shell = self.shell
+        try:
+            while True:
+                if self.produced - self.sent > UNSENT_MAX \
+                        and not shell.ending.is_set():
+                    self.room.clear()
+                    paused = time.monotonic()
+                    await self.room.wait()
+                    # Waiting here is not draining: what the shell printed
+                    # before it ended is read whole, however long the link
+                    # took to come back.
+                    ended = shell.ended_at
+                    if ended is not None:
+                        shell.ended_at = ended + (time.monotonic()
+                                                  - max(paused, ended))
+                    continue
+                data = await loop.run_in_executor(READERS, read_some, shell)
+                if not data:
+                    break
+                self._keep(data)
+                self.wake.set()
+            shell.ending.set()
+            if shell.inbox is not None:
+                shell.inbox.put_nowait(b"")
+            if not self.closed:
+                self.code = await bury(shell)
+                self.over = True
+                self.wake.set()
+        finally:
+            shell.release()
+
+    async def _send(self) -> None:
+        """Sends what is not sent yet, in order, and the end after it."""
+        while not self.closed:
+            await self.wake.wait()
+            self.wake.clear()
+            while self.link is not None and not self.closed:
+                link = self.link
+                if self.sent < self.ring_start:
+                    # Never so; but were it, what is gone is said as such.
+                    self.gap += self.ring_start - self.sent
+                    self.sent = self.ring_start
+                if self.gap:
+                    lost, self.gap = self.gap, 0
+                    await link.send(self.ch, {"t": "gap", "lost": lost})
+                elif self.sent < self.produced:
+                    at = self.sent - self.ring_start
+                    chunk = bytes(self.ring[at:at + FRAME_OUT])
+                    if not chunk:
+                        break
+                    self.sent += len(chunk)
+                    if self.produced - self.sent <= UNSENT_MAX:
+                        self.room.set()
+                    await link.send_bytes(self.head + chunk)
+                elif self.over:
+                    # Gone on its own – someone typed `exit` – rather than
+                    # closed by the hub. Said after all it printed; kept a
+                    # while more, in case the link went with it (ENDED_KEEP).
+                    if self.reported is None:
+                        self.reported = time.monotonic()
+                        await link.send(self.ch, {"t": "exit", "code": self.code})
+                    break
+                else:
+                    break
+
+
+class WebShells:
+    """tTerm Web's terminals on this computer. They belong to the agent, not
+    to a connection: the laptop sleeps, the network blinks, and tTerm Web
+    finds them where they were when the agent is back. Kept while the link
+    is down for KEEP_FOR at most, counted while the computer is awake."""
+
+    def __init__(self) -> None:
+        self._shells: dict[int, WebShell] = {}
+        self._tasks: set[asyncio.Task] = set()
+
+    def __len__(self) -> int:
+        return len(self._shells)
+
+    def spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def channels(self) -> list[int]:
+        return sorted(self._shells)
+
+    def forget(self, web: WebShell) -> None:
+        if self._shells.get(web.ch) is web:
+            del self._shells[web.ch]
+
+    async def open(self, ch: int, msg: dict, link: "Shells") -> None:
+        old = self._shells.get(ch)
+        if old is not None:
+            if old.link is not None and not old.over:
+                return          # the same window twice: the first stays
+            # Kept from before, or over, and the hub no longer knows it: the
+            # number is the hub's to give.
+            old.close()
+        if sum(1 for web in self._shells.values() if not web.over) >= MAX_SHELLS:
+            await link.send(ch, {"t": "exit", "code": None, "error":
+                                 "too many terminals open on this machine"})
+            return
+        shell = Shell()
+        try:
+            shell.start_web(str(msg.get("cmd") or ""), msg.get("cols"),
+                            msg.get("rows"), bool(msg.get("echo", True)))
+        except (OSError, ValueError, TypeError) as exc:
+            await link.send(ch, {"t": "exit", "code": None,
+                                 "error": f"could not start the shell: {exc}"})
+            return
+        web = WebShell(ch, shell, self)
+        self._shells[ch] = web
+        web.attach(link, 0)
+        web.start()
+
+    async def resume(self, ch: int, start: int, link: "Shells") -> None:
+        """tTerm Web takes a kept terminal back, having `start` bytes of it."""
+        web = self._shells.get(ch)
+        if web is None:
+            await link.send(ch, {"t": "exit", "code": None, "gone": True})
+            return
+        web.attach(link, start)
+        log(f"tTerm Web took terminal {ch} back")
+
+    def input(self, ch: int, data: bytes) -> bool:
+        web = self._shells.get(ch)
+        if web is None:
+            return False
+        if web.link is not None and web.shell.inbox is not None:
+            web.shell.inbox.put_nowait(data)
+        return True
+
+    def resize(self, ch: int, msg: dict) -> bool:
+        web = self._shells.get(ch)
+        if web is None:
+            return False
+        web.shell.resize(msg.get("cols"), msg.get("rows"))
+        return True
+
+    def close(self, ch: int | None) -> bool:
+        web = self._shells.get(ch) if isinstance(ch, int) else None
+        if web is None:
+            return False
+        web.close()
+        return True
+
+    def detach(self, link: "Shells") -> None:
+        """The connection went: its terminals wait for the next one."""
+        kept = [web for web in self._shells.values() if web.link is link]
+        for web in kept:
+            web.detach()
+        if kept:
+            log(f"keeping {len(kept)} terminal(s) for tTerm Web until the "
+                "link is back")
+
+    def claim(self, wait: float) -> None:
+        """Offered back in the hello of a connection that is now up: tTerm
+        Web takes them, or ends them; one that does neither is older than
+        this, and they end by themselves."""
+        deadline = time.monotonic() + wait
+        for web in self._shells.values():
+            if web.link is None:
+                web.claim_by = deadline
+
+    def sweep(self) -> None:
+        now = time.monotonic()
+        for web in list(self._shells.values()):
+            if web.link is not None:
+                if web.reported is not None and now - web.reported > ENDED_KEEP:
+                    web.close()         # its end reached tTerm Web
+                continue
+            if web.claim_by is not None and now > web.claim_by:
+                log(f"terminal {web.ch} was not taken back: ending it")
+                web.close()
+            elif now - web.detached_at > KEEP_FOR:
+                log(f"terminal {web.ch} waited {KEEP_FOR / 60:.0f} minutes "
+                    "for the link: ending it")
+                web.close()
+
+    async def keep(self) -> None:
+        while True:
+            await asyncio.sleep(5)
+            self.sweep()
+
+    def close_all(self) -> None:
+        for web in list(self._shells.values()):
+            web.close()
+
+
 class Shells:
     """The shells of one connection: one per terminal window in the bot.
 
@@ -679,13 +1042,15 @@ class Shells:
 
     tTerm Web opens its terminals explicitly, with the command to run and
     the size of the page, and gets the bytes as they are, in binary frames.
+    Those outlive the connection: see WebShells.
     """
 
-    def __init__(self, ws) -> None:
+    def __init__(self, ws, web: WebShells | None = None) -> None:
         self.ws = ws
+        self.web = web if web is not None else WebShells()
         self._shells: dict[int | None, Shell] = {}
-        #: Each shell's tasks: its pump, its watch and, for tTerm Web, its
-        #: writer. They end by themselves once the shell is over.
+        #: Each shell's tasks: its pump and its watch. They end by
+        #: themselves once the shell is over.
         self._tasks: set[asyncio.Task] = set()
         #: tTerm Web's scripts, cancelled when the connection goes.
         self._scripts: set[asyncio.Task] = set()
@@ -699,13 +1064,6 @@ class Shells:
         task = asyncio.create_task(coro)
         tasks.add(task)
         task.add_done_callback(tasks.discard)
-
-    def _begin(self, ch: int | None, shell: Shell) -> None:
-        self._shells[ch] = shell
-        self._task(self._pump(ch, shell))
-        self._task(self._watch(shell))
-        if shell.inbox is not None:
-            self._task(self._feed(shell))
 
     async def send(self, ch: int | None, msg: dict) -> None:
         if ch is not None:
@@ -729,37 +1087,27 @@ class Shells:
                 return
             shell = Shell()
             shell.start()
-            self._begin(ch, shell)
+            self._shells[ch] = shell
+            self._task(self._pump(ch, shell))
+            self._task(watch(shell))
         shell.write(str(data))
 
     async def open(self, ch: int, msg: dict) -> None:
         """tTerm Web opens a terminal."""
-        if not 0 < ch < 2 ** 32 or ch in self._shells:
-            return
-        if len(self._shells) >= MAX_SHELLS:
-            await self.send(ch, {"t": "exit", "code": None, "error":
-                                 "too many terminals open on this machine"})
-            return
-        shell = Shell()
-        try:
-            shell.start_web(str(msg.get("cmd") or ""), msg.get("cols"),
-                            msg.get("rows"), bool(msg.get("echo", True)))
-        except (OSError, ValueError, TypeError) as exc:
-            await self.send(ch, {"t": "exit", "code": None,
-                                 "error": f"could not start the shell: {exc}"})
-            return
-        self._begin(ch, shell)
+        if 0 < ch < 2 ** 32:
+            await self.web.open(ch, msg, self)
+
+    async def resume(self, ch: int, msg: dict) -> None:
+        """tTerm Web takes back a terminal kept from a connection before."""
+        if 0 < ch < 2 ** 32:
+            await self.web.resume(ch, offset(msg.get("from")), self)
 
     def input(self, ch: int, data: bytes) -> None:
         """Keys from tTerm Web for one of its terminals."""
-        shell = self._shells.get(ch)
-        if shell is not None and shell.inbox is not None:
-            shell.inbox.put_nowait(data)
+        self.web.input(ch, data)
 
     def resize(self, ch: int, msg: dict) -> None:
-        shell = self._shells.get(ch)
-        if shell is not None and shell.web:
-            shell.resize(msg.get("cols"), msg.get("rows"))
+        self.web.resize(ch, msg)
 
     def side(self, msg: dict) -> None:
         """One of tTerm Web's scripts; the answer carries the id it came with."""
@@ -777,82 +1125,40 @@ class Shells:
 
     def close(self, ch: int | None) -> bool:
         """The hub is done with this window: end its shell and only that."""
+        if self.web.close(ch):
+            return True
         shell = self._shells.pop(ch, None)
         if shell is None:
             return False        # already gone, for instance after `exit`
         shell.stop()
-        if shell.inbox is not None:
-            shell.inbox.put_nowait(b"")         # its writer may go too
-        self._task(self._finish(shell))
+        self._task(finish(shell))
         return True
 
     def close_all(self) -> None:
-        """The connection is over. Every shell gets its hangup and is
-        collected when it ends, killed if it does not; the scripts stop."""
+        """The connection is over. The bot's shells get their hangup and
+        are collected when they end, killed if they do not; the scripts
+        stop. tTerm Web's terminals wait for the next connection."""
         for ch in list(self._shells):
             self.close(ch)
         for task in list(self._scripts):
             task.cancel()
-
-    async def _finish(self, shell: Shell) -> None:
-        """After the hangup: a shell that ignores it is killed."""
-        if not await shell.wait(HANGUP_GRACE):
-            shell.kill()
-
-    async def _bury(self, shell: Shell) -> int | None:
-        """The exit code of a shell whose terminal is over. One that has not
-        ended by then gets a hangup, and is killed if it ignores that."""
-        if await shell.wait(HANGUP_GRACE):
-            return shell.code
-        shell.stop()
-        if await shell.wait(HANGUP_GRACE):
-            return shell.code
-        shell.kill()
-        await shell.wait(HANGUP_GRACE)
-        return shell.code
-
-    async def _watch(self, shell: Shell) -> None:
-        """Collects the shell's exit status as soon as it ends, so that it
-        never lingers as a zombie, and so that its reader knows it ended."""
-        while not shell.collect():
-            await asyncio.sleep(WAIT_STEP)
-
-    async def _feed(self, shell: Shell) -> None:
-        """Writes tTerm Web's keys into one terminal, in the order they came."""
-        loop = asyncio.get_running_loop()
-        inbox = shell.inbox
-        assert inbox is not None
-        while True:
-            data = await inbox.get()
-            while not inbox.empty():
-                data += inbox.get_nowait()
-            if shell.ending.is_set():
-                return
-            if data:
-                await loop.run_in_executor(WRITERS, write_all, shell, data)
+        self.web.detach(self)
 
     async def _pump(self, ch: int | None, shell: Shell) -> None:
-        """Forwards one shell's output, tagged with its window."""
+        """Forwards one shell's output to the bot, tagged with its window."""
         loop = asyncio.get_running_loop()
-        head = bytes([OUTPUT]) + (ch or 0).to_bytes(4, "big")
         try:
             while True:
                 data = await loop.run_in_executor(READERS, read_some, shell)
                 if not data:
                     break
-                if shell.web:
-                    await self.send_bytes(head + data)
-                else:
-                    await self.send(ch, {"t": "out",
-                                         "data": shell.decoder.decode(data)})
-            if not shell.web:
-                rest = shell.decoder.decode(b"", final=True)
-                if rest:
-                    await self.send(ch, {"t": "out", "data": rest})
-            # The terminal is over: its writer goes too.
+                await self.send(ch, {"t": "out",
+                                     "data": shell.decoder.decode(data)})
+            rest = shell.decoder.decode(b"", final=True)
+            if rest:
+                await self.send(ch, {"t": "out", "data": rest})
+            # The terminal is over.
             shell.ending.set()
-            if shell.inbox is not None:
-                shell.inbox.put_nowait(b"")
 
             if self._shells.get(ch) is shell:
                 # Gone on its own – someone typed `exit` – rather than closed
@@ -860,10 +1166,7 @@ class Shells:
                 # shell that never got its prompt marker and waits for an
                 # answer forever.
                 self._shells.pop(ch, None)
-                code = await self._bury(shell)
-                if shell.web:
-                    await self.send(ch, {"t": "exit", "code": code})
-                    return
+                await bury(shell)
                 await self.send(ch, {"t": "exit"})
                 if ch is None:
                     self.legacy_gone.set()
@@ -901,6 +1204,8 @@ async def serve(ws, shells: Shells, health: Health) -> None:
                 log(f"hub closed {where}, keeping the link")
         elif kind == "open" and ch is not None:
             await shells.open(ch, msg)
+        elif kind == "resume" and ch is not None:
+            await shells.resume(ch, msg)
         elif kind == "size" and ch is not None:
             shells.resize(ch, msg)
         elif kind == "run":
@@ -943,7 +1248,18 @@ async def watchdog(ws, health: Health) -> None:
             return
 
 
-async def connect_once(hub: str, token: str, name: str) -> None:
+async def connect_once(hub: str, token: str, name: str,
+                       web: WebShells | None = None) -> None:
+    """One connection, from the hello until it drops. tTerm Web's terminals
+    are `web`'s, kept for the next one; without it they end with this."""
+    if web is None:
+        web = WebShells()
+        try:
+            await connect_once(hub, token, name, web)
+        finally:
+            web.close_all()
+        return
+
     import websockets
 
     async with websockets.connect(hub, ping_interval=20, ping_timeout=20,
@@ -963,6 +1279,8 @@ async def connect_once(hub: str, token: str, name: str) -> None:
             "channels": 1,
             # And it can serve tTerm Web; the bot does not look for this.
             "web": WEB_PROTOCOL,
+            # tTerm Web's terminals still running from a connection before.
+            "kept": web.channels(),
         }))
         reply = json.loads(await ws.recv())
         if not isinstance(reply, dict):
@@ -974,7 +1292,8 @@ async def connect_once(hub: str, token: str, name: str) -> None:
             raise RuntimeError(error)
         log(f"connected as «{reply.get('name', name)}»")
 
-        shells = Shells(ws)
+        shells = Shells(ws, web)
+        web.claim(CLAIM_WAIT)
         health = Health()
         srv = asyncio.create_task(serve(ws, shells, health))
         dog = asyncio.create_task(watchdog(ws, health))
@@ -990,6 +1309,14 @@ async def connect_once(hub: str, token: str, name: str) -> None:
                 exc = task.exception()
                 if exc is not None:
                     raise exc
+        except asyncio.CancelledError:
+            # Stopped on purpose (Ctrl+C): tTerm Web's terminals end with the
+            # agent, and it hears so now rather than waiting for them to come
+            # back. The bot does not look for this.
+            web.close_all()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(ws.send(json.dumps({"t": "bye"})), 1)
+            raise
         finally:
             # Ending each shell unblocks its reader thread — without this the
             # threads would live until the process exits.
@@ -1009,27 +1336,59 @@ def installed() -> bool:
     return False
 
 
+def stop_on_signals() -> None:
+    """A stop by the system (launchd, systemd) or the window the agent runs
+    in being closed goes the way Ctrl+C does: tTerm Web hears that its
+    terminals end. A hangup the agent was started to ignore (nohup) stays
+    ignored."""
+    task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    if task is None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(sig) is signal.SIG_IGN:
+            continue
+        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+            loop.add_signal_handler(sig, task.cancel)
+
+
 async def main_loop(hub: str, token: str, name: str) -> None:
     backoff = BACKOFF_START
-    while True:
-        try:
-            await connect_once(hub, token, name)
-        except asyncio.CancelledError:
-            raise
-        except Revoked as exc:
-            log(f"access revoked: {exc}. Stopping.")
-            if installed():
-                log("Remove the agent completely: ~/.tterm/uninstall.sh")
-            return
-        except Exception as exc:
-            log(f"no link ({type(exc).__name__}: {exc}), retrying in {backoff:.0f}s")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, BACKOFF_MAX)
-            continue
-        # A clean disconnect — reconnect straight away, no pause needed.
-        backoff = BACKOFF_START
-        log("connection closed, reconnecting")
-        await asyncio.sleep(BACKOFF_START)
+    stop_on_signals()
+    # tTerm Web's terminals live as long as the agent does, through any
+    # number of connections, and end with it.
+    web = WebShells()
+    keeper = asyncio.create_task(web.keep())
+    try:
+        while True:
+            # By the wall clock, which runs on while the machine sleeps: a
+            # connection that was up before a sleep was a working one too.
+            started = time.time()
+            try:
+                await connect_once(hub, token, name, web)
+            except asyncio.CancelledError:
+                raise
+            except Revoked as exc:
+                log(f"access revoked: {exc}. Stopping.")
+                if installed():
+                    log("Remove the agent completely: ~/.tterm/uninstall.sh")
+                return
+            except Exception as exc:
+                if time.time() - started >= HEALTHY_FOR:
+                    # It had been working, so this is an ordinary drop rather
+                    # than a hub that keeps failing: try again soon.
+                    backoff = BACKOFF_START
+                log(f"no link ({type(exc).__name__}: {exc}), retrying in {backoff:.0f}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, BACKOFF_MAX)
+                continue
+            # A clean disconnect: reconnect straight away, no pause needed.
+            backoff = BACKOFF_START
+            log("connection closed, reconnecting")
+            await asyncio.sleep(BACKOFF_START)
+    finally:
+        keeper.cancel()
+        web.close_all()
 
 
 def main() -> None:
@@ -1053,7 +1412,7 @@ def main() -> None:
     log(f"version {__version__}, hub {args.hub}")
     try:
         asyncio.run(main_loop(args.hub, args.token, args.name))
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         log("stopped")
 
 

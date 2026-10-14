@@ -96,18 +96,28 @@ checkout of this repository:
 TTERM_TOKEN=YOUR_TOKEN python3 agent.py --hub wss://YOUR-TTERM-WEB/agent
 ```
 
-The computer is online while it runs; Ctrl+C disconnects it. The token
-connects it within ten minutes and from then on is the computer's key. It
-goes in the environment rather than on the command line, where any user of
-the computer could read it in the list of processes.
+The computer is online while it runs; Ctrl+C disconnects it and ends its
+terminals. The token connects it within ten minutes and from then on is the
+computer's key. It goes in the environment rather than on the command line,
+where any user of the computer could read it in the list of processes.
 
-How it talks to tTerm Web, all on one WebSocket: the hello says `"web": 1`.
-tTerm Web asks it to `open` a terminal (the command, run by your login shell
-with `-c`, the page's size, echo off for the first line), to `size` it and
-`close` it, and to `run` a script with `sh -s`. Keys come in and output goes
-out as binary frames, a byte of kind and four of channel, then the bytes as
-they are. The Telegram bot never sends these and gets the agent it always
-had.
+From 0.12.0 the terminals outlive the connection. When it drops (the laptop
+sleeps, the network blinks), the agent keeps the shells running and the
+last megabyte each of them printed, and tTerm Web keeps the terminals. When
+the agent is back, each goes on where it was: nothing lost, nothing twice.
+The shells wait up to an hour while the computer is awake and the link is
+down; time asleep does not count.
+
+How it talks to tTerm Web, all on one WebSocket: the hello says `"web": 2`
+and which terminals it `kept` from a connection before. tTerm Web asks it
+to `open` a terminal (the command, run by your login shell with `-c`, the
+page's size, echo off for the first line), to `size` it and `close` it, and
+to `run` a script with `sh -s`. Keys come in and output goes out as binary
+frames, a byte of kind and four of channel, then the bytes as they are. A
+kept terminal is taken back with `resume` and the number of bytes tTerm Web
+has of it, and the agent sends the rest; one not taken back within 30
+seconds ends. Stopped with Ctrl+C, the agent says `bye`. The Telegram bot
+never sends these and gets the agent it always had.
 
 ## Requirements
 
