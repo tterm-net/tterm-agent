@@ -38,6 +38,7 @@ import base64
 import codecs
 import concurrent.futures
 import contextlib
+import errno
 import fcntl
 import json
 import math
@@ -47,14 +48,16 @@ import pwd
 import pty
 import select
 import signal
+import socket
 import struct
+import subprocess
 import sys
 import termios
 import threading
 import time
 import warnings
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 DEFAULT_HUB = "wss://install.tterm.net/agent"
 
@@ -67,6 +70,14 @@ BACKOFF_MAX = 30.0
 #: pause starts over from BACKOFF_START instead of staying at what failures
 #: before it (no network yet after a wake, say) had grown it to.
 HEALTHY_FOR = 60.0
+
+#: No network at all: no route out, no name lookup. Such a try never reaches
+#: the hub and costs it nothing, so it is made every few seconds, without
+#: growing the pause, and the agent is back as soon as Wi-Fi is.
+NO_NETWORK_PAUSE = 3.0
+#: What the system says when this machine has no way out right now.
+NO_ROUTE = {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN,
+            errno.EADDRNOTAVAIL}
 
 READ_CHUNK = 65536
 
@@ -175,16 +186,95 @@ PLAIN_PATH = ":".join(
 
 
 class Revoked(Exception):
-    """The hub says this machine was removed. Retrying is pointless."""
+    """The hub says this machine was removed. Retrying is pointless.
+
+    `forget`: tTerm Web says so in as many words (from 0.0.8, on Remove
+    machine and for a key that stopped working then): the key is dead and
+    goes from the settings file. Any other refusal leaves it, so that a
+    tTerm Web rolled back or briefly on the wrong database cannot make
+    every computer forget its key."""
+
+    def __init__(self, error: str, forget: bool = False) -> None:
+        super().__init__(error)
+        self.forget = forget
 
 
 def machine_name() -> str:
     """The machine's own name.
 
+    On a Mac the one from its settings (Sharing), which stays put: the
+    hostname follows the network, and a router may make it "MacBookPro.lan"
+    for an evening. Elsewhere, and if that fails, the hostname:
     platform.node() returns "MacBook-Pro-Denis.local" on macOS — the .local
     suffix only gets in the way, everyone has it.
     """
+    if sys.platform == "darwin":
+        with contextlib.suppress(Exception):
+            got = subprocess.run(["scutil", "--get", "LocalHostName"],
+                                 capture_output=True, text=True, timeout=5)
+            name = got.stdout.strip()
+            if got.returncode == 0 and name:
+                return name
     return (platform.node() or "computer").removesuffix(".local")
+
+
+def no_network(exc: BaseException) -> bool:
+    """Whether a try failed on this side, for want of any network: no name
+    lookup, no route. Not a hub that refuses or is down."""
+    if isinstance(exc, socket.gaierror):
+        return True
+    return isinstance(exc, OSError) and exc.errno in NO_ROUTE
+
+
+#: The settings file the agent was started with (--env-file), if any.
+ENV_FILE: str | None = None
+
+
+def forget_key(path: str) -> None:
+    """The computer was removed from tTerm Web: its key goes from the
+    settings file, so that the installer, run again, makes a new one rather
+    than bring back the one it was removed with. The file says the computer
+    was removed, and the agent started with it says so and stops (with
+    success, so that autostart leaves it stopped): left to start, it would
+    join with the token alone, which may still work for a few minutes and
+    is in the shell's history."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        kept = [line if line.endswith("\n") else line + "\n" for line in lines
+                if not line.startswith(("TTERM_KEY=", "TTERM_REMOVED="))]
+        kept.append("TTERM_REMOVED=1\n")
+        if not any(line.startswith("TTERM_KEY=") for line in lines) and \
+                "TTERM_REMOVED=1\n" in lines:
+            return
+        fresh = path + ".new"
+        fd = os.open(fresh, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.writelines(kept)
+        os.replace(fresh, path)
+        log("forgot this computer's key: the installer makes a new one")
+    except OSError as exc:
+        log(f"could not forget the key in {path}: {exc}")
+
+
+def read_env_file(path: str) -> dict[str, str]:
+    """NAME=value lines, as an installer writes them; blank lines and
+    comments are skipped. The installer for tTerm Web keeps the token and
+    the key there, readable by this user only, and not in the autostart
+    entry."""
+    values: dict[str, str] = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            values[name.strip()] = value.strip()
+    with contextlib.suppress(OSError):
+        if os.stat(path).st_mode & 0o077:
+            log(f"warning: {path} can be read by others; it holds this "
+                "computer's key (chmod 600 it)")
+    return values
 
 
 def set_process_name(name: str = "tterm-agent") -> None:
@@ -251,6 +341,9 @@ def web_env(terminal: bool) -> dict[str, str]:
         env["LANG"] = "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8"
     if terminal:
         env["TERM"] = "xterm-256color"
+        # Where this agent lives: tTerm Web's installer, run in one of these
+        # terminals, would stop the agent it runs through, and refuses.
+        env["TTERM_AGENT_DIR"] = os.path.dirname(os.path.abspath(__file__))
     return env
 
 
@@ -1218,30 +1311,43 @@ async def serve(ws, shells: Shells, health: Health) -> None:
             # after the usual pause, growing, rather than every second.
             error = str(msg.get("error") or "the hub ended the connection")
             if msg.get("revoked") is True:
-                raise Revoked(error)
+                raise Revoked(error, msg.get("forget") is True)
             raise RuntimeError(error)
 
 
 async def watchdog(ws, health: Health) -> None:
     """Drops a dead connection so that reconnection can kick in."""
     last_note = time.monotonic()
+    # Signs of life sent since the last note, and after how many of them the
+    # hub was heard before the next one went: the line in the log then says
+    # how the link has been, not only that it is still there.
+    sent = answered = 0
+    went = 0.0
     while True:
         await asyncio.sleep(HEARTBEAT)
+        # Answered: the hub was heard after the last one went.
+        if sent and health.last_in >= went:
+            answered += 1
 
         if time.monotonic() - last_note >= ALIVE_EVERY:
+            minutes = (time.monotonic() - last_note) / 60
             last_note = time.monotonic()
-            log(f"link alive, hub answered {health.silent_for():.0f}s ago")
+            log(f"link alive: the hub answered {answered} of {sent} signs of "
+                f"life in {minutes:.0f} min")
+            sent = answered = 0
 
         drift = health.slept()
         if drift > SLEEP_JUMP:
             log(f"machine slept for about {drift:.0f}s — reconnecting")
             return
 
+        went = time.monotonic()
         try:
             await ws.send(json.dumps({"t": "hb"}))
         except Exception as exc:
             log(f"could not send sign of life: {type(exc).__name__}")
             return
+        sent += 1
 
         if health.silent_for() > SILENCE_LIMIT:
             log(f"hub silent for {health.silent_for():.0f}s — reconnecting")
@@ -1249,13 +1355,17 @@ async def watchdog(ws, health: Health) -> None:
 
 
 async def connect_once(hub: str, token: str, name: str,
-                       web: WebShells | None = None) -> None:
+                       web: WebShells | None = None, key: str = "") -> None:
     """One connection, from the hello until it drops. tTerm Web's terminals
-    are `web`'s, kept for the next one; without it they end with this."""
+    are `web`'s, kept for the next one; without it they end with this.
+
+    `key`, from tTerm Web's installer (from 0.13.0), is this computer's own
+    key, made on it and never shown anywhere: the token then only lets it
+    join once, and tTerm Web knows it by the key from there on."""
     if web is None:
         web = WebShells()
         try:
-            await connect_once(hub, token, name, web)
+            await connect_once(hub, token, name, web, key)
         finally:
             web.close_all()
         return
@@ -1267,6 +1377,8 @@ async def connect_once(hub: str, token: str, name: str,
         await ws.send(json.dumps({
             "t": "hello",
             "token": token,
+            # Only from tTerm Web's installer; the bot never gets one.
+            **({"key": key} if key else {}),
             "name": name,
             "user": os.environ.get("USER") or os.environ.get("LOGNAME", ""),
             "os": f"{platform.system()} {platform.release()}",
@@ -1288,7 +1400,7 @@ async def connect_once(hub: str, token: str, name: str,
         if reply.get("t") != "welcome":
             error = reply.get("error", "the hub refused the connection")
             if reply.get("revoked"):
-                raise Revoked(error)
+                raise Revoked(error, reply.get("forget") is True)
             raise RuntimeError(error)
         log(f"connected as «{reply.get('name', name)}»")
 
@@ -1327,13 +1439,17 @@ async def connect_once(hub: str, token: str, name: str,
                 await ws.close()
 
 
-def installed() -> bool:
-    """Whether this is the agent the bot's installer put in ~/.tterm, which
-    comes with its uninstaller, rather than one started by hand."""
+def uninstaller() -> str | None:
+    """The uninstaller next to this agent, if an installer put it there:
+    ~/.tterm for the bot, ~/.tterm-web for tTerm Web. None for an agent
+    started by hand."""
     with contextlib.suppress(Exception):
-        return os.path.samefile(__file__,
-                                os.path.expanduser("~/.tterm/agent.py"))
-    return False
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "uninstall.sh")
+        if os.path.isfile(path):
+            home = os.path.expanduser("~")
+            return "~" + path[len(home):] if path.startswith(home + "/") else path
+    return None
 
 
 def stop_on_signals() -> None:
@@ -1352,37 +1468,60 @@ def stop_on_signals() -> None:
             loop.add_signal_handler(sig, task.cancel)
 
 
-async def main_loop(hub: str, token: str, name: str) -> None:
+async def main_loop(hub: str, token: str, name: str, key: str = "") -> None:
     backoff = BACKOFF_START
     stop_on_signals()
     # tTerm Web's terminals live as long as the agent does, through any
     # number of connections, and end with it.
     web = WebShells()
     keeper = asyncio.create_task(web.keep())
+    # Since when there has been no network, by the monotonic clock: said
+    # once, then every ALIVE_EVERY, not at every try.
+    offline_since: float | None = None
+    offline_note = 0.0
     try:
         while True:
             # By the wall clock, which runs on while the machine sleeps: a
             # connection that was up before a sleep was a working one too.
             started = time.time()
             try:
-                await connect_once(hub, token, name, web)
+                await connect_once(hub, token, name, web, key)
             except asyncio.CancelledError:
                 raise
             except Revoked as exc:
-                log(f"access revoked: {exc}. Stopping.")
-                if installed():
-                    log("Remove the agent completely: ~/.tterm/uninstall.sh")
+                log(f"access revoked: {str(exc).rstrip('.')}. Stopping.")
+                if exc.forget and key and ENV_FILE:
+                    forget_key(ENV_FILE)
+                remove = uninstaller()
+                if remove:
+                    log(f"Remove the agent completely: {remove}")
                 return
             except Exception as exc:
                 if time.time() - started >= HEALTHY_FOR:
                     # It had been working, so this is an ordinary drop rather
                     # than a hub that keeps failing: try again soon.
                     backoff = BACKOFF_START
+                if no_network(exc):
+                    # Nothing to wait out at the hub: try again in a moment,
+                    # and keep the pause as it was for when the network is
+                    # back but the hub is not.
+                    now = time.monotonic()
+                    if offline_since is None:
+                        offline_since = offline_note = now
+                        log(f"no network ({type(exc).__name__}: {exc}), "
+                            f"trying every {NO_NETWORK_PAUSE:.0f}s until it is back")
+                    elif now - offline_note >= ALIVE_EVERY:
+                        offline_note = now
+                        log(f"still no network, for {(now - offline_since) / 60:.0f} min")
+                    await asyncio.sleep(NO_NETWORK_PAUSE)
+                    continue
+                offline_since = None
                 log(f"no link ({type(exc).__name__}: {exc}), retrying in {backoff:.0f}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, BACKOFF_MAX)
                 continue
             # A clean disconnect: reconnect straight away, no pause needed.
+            offline_since = None
             backoff = BACKOFF_START
             log("connection closed, reconnecting")
             await asyncio.sleep(BACKOFF_START)
@@ -1392,13 +1531,42 @@ async def main_loop(hub: str, token: str, name: str) -> None:
 
 
 def main() -> None:
+    global ENV_FILE
+    # The settings file goes first: what it holds becomes the defaults below,
+    # over whatever the environment it was started from says.
+    early = argparse.ArgumentParser(add_help=False)
+    early.add_argument("--env-file")
+    env_file = early.parse_known_args()[0].env_file
+    if env_file:
+        try:
+            values = read_env_file(env_file)
+        except OSError as exc:
+            sys.exit(f"Could not read {env_file}: {exc}")
+        if values.get("TTERM_REMOVED") == "1":
+            # forget_key wrote it: removed in tTerm Web. Not an error, so
+            # that autostart leaves the agent stopped.
+            log("this computer was removed from tTerm Web: run the "
+                "installer from Add a machine to connect it again")
+            return
+        for name, value in values.items():
+            if name.startswith("TTERM_"):
+                os.environ[name] = value
+        ENV_FILE = env_file
+
     parser = argparse.ArgumentParser(description="tTerm agent")
     parser.add_argument("--hub", default=os.environ.get("TTERM_HUB", DEFAULT_HUB))
     parser.add_argument("--token", default=os.environ.get("TTERM_TOKEN", ""))
+    parser.add_argument("--key", default=os.environ.get("TTERM_KEY", ""),
+                        help=argparse.SUPPRESS)
     parser.add_argument("--name",
                         default=os.environ.get("TTERM_NAME") or machine_name())
+    parser.add_argument("--env-file",
+                        help="read TTERM_HUB, TTERM_TOKEN and the rest from this file")
     parser.add_argument("--version", action="version", version=__version__)
     args = parser.parse_args()
+    # Read: no program started from here is to see them.
+    for name in ("TTERM_TOKEN", "TTERM_KEY"):
+        os.environ.pop(name, None)
 
     if not args.token:
         sys.exit("No token given. Get the command from the bot (/addhost) or "
@@ -1411,7 +1579,7 @@ def main() -> None:
     set_process_name()
     log(f"version {__version__}, hub {args.hub}")
     try:
-        asyncio.run(main_loop(args.hub, args.token, args.name))
+        asyncio.run(main_loop(args.hub, args.token, args.name, args.key))
     except (KeyboardInterrupt, asyncio.CancelledError):
         log("stopped")
 
