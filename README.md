@@ -8,6 +8,14 @@ which is in development.
 [tterm.net](https://tterm.net) · [open the bot](https://t.me/tTermNetBot) ·
 [updates](https://t.me/tTermBlog) · [bot source](https://github.com/tterm-net/tTerm)
 
+> **tTerm Web has an agent of its own now.** From 0.14.0, tTerm Web's agent
+> is `tterm-agent` in [tterm-app](https://github.com/tterm-net/tterm-app)
+> (`agent/`): one file for macOS and Linux, without Python, released signed,
+> and it updates itself. Add a machine, then Computer, in tTerm Web installs
+> it; a computer set up with this agent.py moves over when that command is
+> run on it again, and stays the same machine. This agent.py stays the
+> Telegram bot's.
+
 ## Why it exists
 
 A server with a public address we connect to directly over SSH. A laptop is
